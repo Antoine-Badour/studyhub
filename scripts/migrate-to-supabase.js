@@ -1,0 +1,187 @@
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { gzipSync } = require('node:zlib');
+const Database = require('better-sqlite3');
+const postgres = require('postgres').default;
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+
+const root = path.resolve(__dirname, '..');
+const envPath = path.join(root, '.env');
+if (fs.existsSync(envPath)) {
+  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (match && !Object.hasOwn(process.env, match[1])) process.env[match[1]] = match[2].replace(/^(['"])(.*)\1$/, '$2');
+  }
+}
+
+const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+if (!databaseUrl) {
+  console.error('Add DATABASE_URL to .env before running the migration.');
+  process.exit(1);
+}
+
+const dataDir = path.resolve(process.env.STUDYSPACE_DATA_DIR || path.join(root, 'data'));
+const accountsPath = path.join(dataDir, 'accounts.sqlite');
+const usersDir = path.join(dataDir, 'users');
+const legacyDefault = path.join(dataDir, 'studyspace.sqlite');
+const uploadsDir = path.resolve(process.env.STUDYSPACE_UPLOAD_DIR || path.join(root, 'uploads'));
+
+function b2Settings() {
+  const region = process.env.B2_REGION || '';
+  let endpoint = process.env.B2_ENDPOINT || (region ? `https://s3.${region}.backblazeb2.com` : '');
+  if (endpoint && !/^https?:\/\//i.test(endpoint)) endpoint = `https://${endpoint}`;
+  const bucket = process.env.B2_BUCKET_NAME || '';
+  const configured = !!(region && bucket && process.env.B2_APPLICATION_KEY_ID && process.env.B2_APPLICATION_KEY);
+  return { configured, region, bucket, endpoint };
+}
+
+async function snapshotSqlite(filename) {
+  if (!fs.existsSync(filename)) return null;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'studyspace-migration-'));
+  const copy = path.join(directory, 'snapshot.sqlite');
+  const source = new Database(filename, { readonly: true, fileMustExist: true });
+  try {
+    await source.backup(copy);
+  } finally {
+    source.close();
+  }
+  const bytes = fs.readFileSync(copy);
+  fs.rmSync(directory, { recursive: true, force: true });
+  return bytes;
+}
+
+function emptySqlite() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'studyspace-empty-'));
+  const filename = path.join(directory, 'empty.sqlite');
+  const database = new Database(filename);
+  database.close();
+  const bytes = fs.readFileSync(filename);
+  fs.rmSync(directory, { recursive: true, force: true });
+  return bytes;
+}
+
+async function copyLocalUploadsIntoB2(accountId, sqliteBytes, b2) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), `studyspace-files-${accountId}-`));
+  const filename = path.join(directory, 'workspace.sqlite');
+  fs.writeFileSync(filename, sqliteBytes);
+  const database = new Database(filename);
+  try {
+    const localDocs = database.prepare("SELECT id,name,mime_type,storage_key FROM documents WHERE storage_backend='local' AND storage_key IS NOT NULL").all();
+    if (!localDocs.length) return sqliteBytes;
+    if (!b2) throw new Error(`${localDocs.length} local upload(s) need Backblaze B2. Add the B2 settings to .env before migrating.`);
+    for (const doc of localDocs) {
+      const localPath = path.join(uploadsDir, doc.storage_key.replace(/\//g, '_'));
+      if (!fs.existsSync(localPath)) throw new Error(`The local original for "${doc.name}" was not found in uploads/. Restore it before migrating.`);
+      const body = fs.readFileSync(localPath);
+      await b2.client.send(new PutObjectCommand({
+        Bucket: b2.bucket,
+        Key: doc.storage_key,
+        Body: body,
+        ContentLength: body.length,
+        ContentType: doc.mime_type || 'application/octet-stream',
+        Metadata: { originalname: doc.name },
+      }));
+      database.prepare("UPDATE documents SET storage_backend='backblaze' WHERE id=?").run(doc.id);
+    }
+    database.pragma('wal_checkpoint(TRUNCATE)');
+    database.close();
+    return fs.readFileSync(filename);
+  } finally {
+    try { database.close(); } catch {}
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+async function main() {
+  if (!fs.existsSync(accountsPath)) throw new Error('Local data/accounts.sqlite was not found. Keep the app data folder beside server.js and try again.');
+  const source = new Database(accountsPath, { readonly: true, fileMustExist: true });
+  let accounts = [];
+  let sessions = [];
+  try {
+    accounts = source.prepare('SELECT id,email,password_hash,is_owner,created_at FROM accounts ORDER BY id').all();
+    sessions = source.prepare('SELECT token_hash,account_id,expires_at FROM sessions').all();
+  } finally {
+    source.close();
+  }
+
+  const sql = postgres(databaseUrl, { max: 1, prepare: false, ssl: 'require', connect_timeout: 10, pipeline: false });
+  try {
+    await sql`CREATE TABLE IF NOT EXISTS studyspace_accounts (
+      id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      is_owner SMALLINT NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`;
+    await sql`CREATE UNIQUE INDEX IF NOT EXISTS studyspace_single_owner_idx ON studyspace_accounts ((is_owner)) WHERE is_owner=1`;
+    await sql`CREATE TABLE IF NOT EXISTS studyspace_sessions (
+      token_hash TEXT PRIMARY KEY,
+      account_id BIGINT NOT NULL REFERENCES studyspace_accounts(id) ON DELETE CASCADE,
+      expires_at TIMESTAMPTZ NOT NULL
+    )`;
+    await sql`CREATE INDEX IF NOT EXISTS studyspace_sessions_account_idx ON studyspace_sessions(account_id)`;
+    await sql`CREATE TABLE IF NOT EXISTS studyspace_user_databases (
+      account_id BIGINT PRIMARY KEY REFERENCES studyspace_accounts(id) ON DELETE CASCADE,
+      db_data BYTEA NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`;
+    await sql`CREATE TABLE IF NOT EXISTS studyspace_migrations (name TEXT PRIMARY KEY, completed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)`;
+    for (const table of ['studyspace_accounts','studyspace_sessions','studyspace_user_databases','studyspace_migrations']) {
+      await sql.unsafe(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+      await sql.unsafe(`REVOKE ALL ON TABLE ${table} FROM PUBLIC, anon, authenticated`);
+    }
+
+    const migrationStatus = await sql`SELECT 1 FROM studyspace_migrations WHERE name='sqlite-to-supabase-v1'`;
+    if (migrationStatus.length) {
+      console.log('Supabase already has the SQLite migration marker; no changes made.');
+      return;
+    }
+    const existing = await sql`SELECT COUNT(*)::int AS n FROM studyspace_accounts`;
+    if (existing[0].n) throw new Error('Supabase already has accounts but no migration marker; stopping to protect existing data.');
+
+    const b2Config = b2Settings();
+    const b2 = b2Config.configured ? {
+      bucket: b2Config.bucket,
+      client: new S3Client({ endpoint: b2Config.endpoint, region: b2Config.region, forcePathStyle: true, credentials: { accessKeyId: process.env.B2_APPLICATION_KEY_ID, secretAccessKey: process.env.B2_APPLICATION_KEY } }),
+    } : null;
+    const defaultBytes = accounts.find(account => account.is_owner) ? await snapshotSqlite(legacyDefault) : null;
+    const studyDatabases = [];
+    for (const account of accounts) {
+      const userPath = path.join(usersDir, `user-${account.id}.sqlite`);
+      const bytes = await snapshotSqlite(userPath) || (account.is_owner ? defaultBytes : null) || emptySqlite();
+      studyDatabases.push({ id: account.id, bytes: await copyLocalUploadsIntoB2(account.id, bytes, b2) });
+    }
+
+    const result = await sql.begin(async tx => {
+      await tx`SELECT pg_advisory_xact_lock(30818041)`;
+      const done = await tx`SELECT 1 FROM studyspace_migrations WHERE name='sqlite-to-supabase-v1'`;
+      if (done.length) return 'already';
+      const count = await tx`SELECT COUNT(*)::int AS n FROM studyspace_accounts`;
+      if (count[0].n) throw new Error('Supabase already has accounts but no migration marker; stopping to protect existing data.');
+
+      for (const account of accounts) {
+        await tx`INSERT INTO studyspace_accounts(id,email,password_hash,is_owner,created_at)
+          VALUES(${account.id},${account.email},${account.password_hash},${account.is_owner},${account.created_at})`;
+      }
+      for (const session of sessions) {
+        await tx`INSERT INTO studyspace_sessions(token_hash,account_id,expires_at)
+          VALUES(${session.token_hash},${session.account_id},${session.expires_at}) ON CONFLICT(token_hash) DO NOTHING`;
+      }
+      for (const database of studyDatabases) await tx`INSERT INTO studyspace_user_databases(account_id,db_data) VALUES(${database.id},${gzipSync(database.bytes)})`;
+      await tx`SELECT setval(pg_get_serial_sequence('studyspace_accounts','id'),GREATEST((SELECT COALESCE(MAX(id),1) FROM studyspace_accounts),1),true)`;
+      await tx`INSERT INTO studyspace_migrations(name) VALUES('sqlite-to-supabase-v1')`;
+      return 'migrated';
+    });
+    console.log(result === 'already'
+      ? 'Supabase already has the SQLite migration marker; no changes made.'
+      : `Migrated ${accounts.length} account(s), ${sessions.length} session(s), and available study database(s) to Supabase.`);
+  } finally {
+    await sql.end();
+  }
+}
+
+main().catch(error => {
+  console.error(`Supabase migration failed (${error.code || error.name}): ${error.message}`);
+  process.exitCode = 1;
+});

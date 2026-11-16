@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 920" fill="none">
+ <defs>
+  <linearGradient id="skin" x1="220" y1="280" x2="600" y2="750" gradientUnits="userSpaceOnUse"><stop stop-color="#c7ed8d"/><stop offset="1" stop-color="#629b56"/></linearGradient>
+  <linearGradient id="belly" x1="350" y1="480" x2="530" y2="740" gradientUnits="userSpaceOnUse"><stop stop-color="#e8db9d"/><stop offset="1" stop-color="#c1b877"/></linearGradient>
+  <g id="fern" stroke="#82ad63" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"><path d="M0 190C18 124 40 59 91 0"/><path d="M21 135 0 94m34 20 36-31M39 91 17 55m42 18 35-35M56 55 40 27"/><path d="M18 146c-20-4-33-14-39-30 20 0 33 9 39 30Zm22-41c-1-20 5-35 21-47 5 19-2 35-21 47Zm18-34c-20-6-31-17-35-34 19 2 31 14 35 34Zm23-31C77 19 82 8 95 0c4 15-1 27-12 40Z" fill="#82ad63" fill-opacity=".3"/></g>
+ </defs>
+ <g opacity=".86" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M62 841c87-36 157-43 223-22m228 30c70-29 135-32 198-9" stroke="#91b96b" stroke-width="3" opacity=".45"/>
+  <g transform="translate(80 705) scale(1.05)"><use href="#fern"/></g>
+  <g transform="translate(690 720) scale(-.85 .85)"><use href="#fern"/></g>
+  <g transform="translate(590 287) scale(.55)"><use href="#fern"/></g>
+  <!-- Friendly long-tail dinosaur silhouette -->
+  <path d="M165 572c78 6 113-40 161-101 46-58 107-88 186-78 56 7 99 38 114 82 8 23 1 43-19 54l-27 14 25 22c14 13 12 32-4 43-20 15-50 10-69-6l-40-34c-11 32-18 72-20 116-2 37-20 61-51 62-35 1-51-25-46-62l10-91c-31 24-65 38-105 39-39 1-70-12-96-38l-76 61c-26 21-55 19-70-2-15-22-4-47 22-66l61-45c-35 18-62 27-96 27-27 0-43-13-43-35 0-23 17-38 46-36l137 8Z" fill="url(#skin)" stroke="#436f48" stroke-width="8"/>
+  <path d="M422 442c31 8 56 30 67 58m-48 58c-15 30-20 70-21 122m-124-151c21 28 48 39 79 38" stroke="#527c4c" stroke-width="5"/>
+  <path d="M497 468c23 3 43 1 61-6l14 28-26 14c-24 12-45 6-55-13l-8-14 14-9Z" fill="url(#belly)" stroke="#527c4c" stroke-width="5"/>
+  <circle cx="576" cy="445" r="8" fill="#243b2d"/><circle cx="579" cy="442" r="2.5" fill="#f5f6db"/>
+  <path d="m603 484 16 4-13 9" stroke="#385a3d" stroke-width="4"/>
+  <path d="m380 405 13-28 13 28m23-15 13-27 13 31m23-20 11-23 13 29" fill="#a2d96f" stroke="#436f48" stroke-width="4"/>
+  <path d="M390 663c-5 16-4 29 1 40m-69-46c-3 17 0 29 6 38" stroke="#436f48" stroke-width="9"/>
+  <!-- Small pterosaur -->
+  <path d="M202 255c30-38 58-38 83-3 25-35 53-35 83 3-31-13-58-9-83 18-25-27-52-31-83-18Z" fill="#9fd18a" stroke="#5f925b" stroke-width="5"/>
+  <circle cx="285" cy="273" r="4" fill="#34583d"/>
+  <circle cx="126" cy="377" r="5" fill="#c8dc83"/><circle cx="655" cy="595" r="4" fill="#c8dc83"/><circle cx="654" cy="195" r="5" fill="#c8dc83"/>
+ </g>
+</svg>
