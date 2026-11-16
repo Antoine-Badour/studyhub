@@ -4,7 +4,6 @@ const fs = require('fs');
 const os = require('os');
 const { gzipSync, gunzipSync } = require('zlib');
 const Database = require('better-sqlite3');
-const postgres = require('postgres').default;
 const multer = require('multer');
 const { randomUUID, randomBytes, createHash, scrypt: scryptCallback, timingSafeEqual } = require('crypto');
 const { promisify } = require('util');
@@ -25,7 +24,18 @@ app.use(express.json({ limit: '1mb' }));
 const dataDir = path.resolve(process.env.STUDYSPACE_DATA_DIR || path.join(__dirname, 'data'));
 const postgresUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL;
 const remoteStorage = !!postgresUrl && process.env.STUDYSPACE_FORCE_SQLITE !== '1';
-const pg = remoteStorage ? postgres(postgresUrl, { max: 1, prepare: false, ssl: 'require', connect_timeout: 10, pipeline: false }) : null;
+// postgres is ESM-only in the current dependency release. Load it dynamically so
+// Vercel's CommonJS function loader can import this CommonJS Express app.
+const pgClient = remoteStorage
+ ? import('postgres').then(({ default: createPostgres }) => createPostgres(postgresUrl, { max: 1, prepare: false, ssl: 'require', connect_timeout: 10, pipeline: false }))
+ : null;
+const pg = remoteStorage ? Object.assign(
+ (strings, ...values) => pgClient.then(client => client(strings, ...values)),
+ {
+  unsafe: (...args) => pgClient.then(client => client.unsafe(...args)),
+  begin: callback => pgClient.then(client => client.begin(tx => callback((strings, ...values) => tx(strings, ...values)))),
+ }
+) : null;
 let defaultDb = null;
 let authDb = null;
 if (!remoteStorage) {
