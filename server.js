@@ -134,17 +134,34 @@ function createEmptyStudyDatabase() {
  for (const suffix of ['', '-wal', '-shm']) try { fs.unlinkSync(filename + suffix); } catch {}
  return bytes;
 }
+const workspaceSnapshots = new Map();
+function cacheWorkspaceSnapshot(workspaceId, version, bytes) {
+ workspaceSnapshots.delete(String(workspaceId));
+ workspaceSnapshots.set(String(workspaceId), { version, bytes: Buffer.from(bytes) });
+ while (workspaceSnapshots.size > 4) workspaceSnapshots.delete(workspaceSnapshots.keys().next().value);
+}
 async function withRemoteUserDatabase(req, res, next) {
  let tempFile;
  try {
   // Read-only requests do not need the database write lock or a new compressed
   // snapshot. This keeps dashboard and library reads much lighter on Vercel.
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-   const owner = await pg`SELECT id FROM studyspace_accounts WHERE is_owner=1 LIMIT 1`;
-   const workspaceId = owner[0]?.id || req.account.id;
-   const stored = await pg`SELECT db_data FROM studyspace_user_databases WHERE account_id=${workspaceId}`;
+   const metadata = await pg`
+    SELECT selected.workspace_id, d.updated_at::text AS version
+    FROM (SELECT COALESCE((SELECT id FROM studyspace_accounts WHERE is_owner=1 LIMIT 1), ${req.account.id}) AS workspace_id) selected
+    LEFT JOIN studyspace_user_databases d ON d.account_id=selected.workspace_id
+   `;
+   const workspaceId = metadata[0].workspace_id;
+   const version = metadata[0].version;
+   let snapshot = workspaceSnapshots.get(String(workspaceId));
+   if (!snapshot || snapshot.version !== version) {
+    const stored = await pg`SELECT db_data FROM studyspace_user_databases WHERE account_id=${workspaceId}`;
+    const bytes = stored[0]?.db_data ? gunzipSync(stored[0].db_data) : createEmptyStudyDatabase();
+    cacheWorkspaceSnapshot(workspaceId, version, bytes);
+    snapshot = workspaceSnapshots.get(String(workspaceId));
+   }
    tempFile = path.join(os.tmpdir(), `studyspace-read-${workspaceId}-${randomUUID()}.sqlite`);
-   fs.writeFileSync(tempFile, stored[0]?.db_data ? gunzipSync(stored[0].db_data) : createEmptyStudyDatabase(), { mode: 0o600 });
+   fs.writeFileSync(tempFile, snapshot.bytes, { mode: 0o600 });
    const target = new Database(tempFile);
    initializeStudyDb(target);
    let cleaned = false;
@@ -173,9 +190,11 @@ async function withRemoteUserDatabase(req, res, next) {
      target.pragma('wal_checkpoint(TRUNCATE)');
      target.close();
      const bytes = fs.readFileSync(tempFile);
-     await tx`INSERT INTO studyspace_user_databases(account_id,db_data,updated_at)
+     const saved = await tx`INSERT INTO studyspace_user_databases(account_id,db_data,updated_at)
        VALUES(${workspaceId},${gzipSync(bytes) },CURRENT_TIMESTAMP)
-       ON CONFLICT(account_id) DO UPDATE SET db_data=EXCLUDED.db_data, updated_at=CURRENT_TIMESTAMP`;
+       ON CONFLICT(account_id) DO UPDATE SET db_data=EXCLUDED.db_data, updated_at=CURRENT_TIMESTAMP
+       RETURNING updated_at::text AS version`;
+     cacheWorkspaceSnapshot(workspaceId, saved[0]?.version, bytes);
     })();
     return persistence;
    };
