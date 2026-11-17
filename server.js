@@ -137,6 +137,28 @@ function createEmptyStudyDatabase() {
 async function withRemoteUserDatabase(req, res, next) {
  let tempFile;
  try {
+  // Read-only requests do not need the database write lock or a new compressed
+  // snapshot. This keeps dashboard and library reads much lighter on Vercel.
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+   const owner = await pg`SELECT id FROM studyspace_accounts WHERE is_owner=1 LIMIT 1`;
+   const workspaceId = owner[0]?.id || req.account.id;
+   const stored = await pg`SELECT db_data FROM studyspace_user_databases WHERE account_id=${workspaceId}`;
+   tempFile = path.join(os.tmpdir(), `studyspace-read-${workspaceId}-${randomUUID()}.sqlite`);
+   fs.writeFileSync(tempFile, stored[0]?.db_data ? gunzipSync(stored[0].db_data) : createEmptyStudyDatabase(), { mode: 0o600 });
+   const target = new Database(tempFile);
+   initializeStudyDb(target);
+   let cleaned = false;
+   const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try { target.close(); } catch {}
+    for (const suffix of ['', '-wal', '-shm']) try { fs.unlinkSync(tempFile + suffix); } catch {}
+   };
+   res.once('finish', cleanup);
+   res.once('close', cleanup);
+   requestDb.run(target, next);
+   return;
+  }
   await pg.begin(async tx => {
    const owner = await tx`SELECT id FROM studyspace_accounts WHERE is_owner=1 LIMIT 1`;
    const workspaceId = owner[0]?.id || req.account.id;
@@ -432,7 +454,13 @@ app.delete('/api/calendar-events/:id',(q,r)=>{run('DELETE FROM calendar_events W
 app.get('/api/settings',(_,r)=>{const rows=db.prepare('SELECT * FROM settings ORDER BY key').all();r.json(Object.fromEntries(rows.map(x=>[x.key,x.value])))});
 app.put('/api/settings',(q,r)=>{for(const [k,v] of Object.entries(q.body)){if(['theme','explanation','language','defaultDifficulty','autoMemory'].includes(k))run('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',k,String(v).slice(0,100))}r.json({ok:true})});
 app.get('/api/export',(_,r)=>{const out={};for(const t of ['settings','subjects','memories','conversations','messages','courses','lessons','documents','notes','decks','flashcards','quizzes','quiz_attempts','study_sessions','calendar_events'])out[t]=all(t);r.setHeader('Content-Disposition','attachment; filename="studyspace-backup.json"');r.json(out)});
-app.use('/api',(_,r)=>r.status(404).json({error:'API route not found'}));app.use(express.static(path.join(__dirname,'public')));app.get(/.*/,(q,r)=>r.sendFile(path.join(__dirname,'public','index.html')));
+app.use('/api',(_,r)=>r.status(404).json({error:'API route not found'}));
+app.use((error, req, res, next) => {
+ console.error('Studyspace request failed:', req.method, req.path, error.code || error.name || 'Error');
+ if (res.headersSent) return next(error);
+ res.status(error.status || 500).json({ error: 'Studyspace could not complete that request. Check the latest Vercel Runtime Log for the request error code.' });
+});
+app.use(express.static(path.join(__dirname,'public')));app.get(/.*/,(q,r)=>r.sendFile(path.join(__dirname,'public','index.html')));
 module.exports = app;
 if (require.main === module) {
  databaseReady.then(() => app.listen(Number(process.env.PORT)||3000,()=>console.log(`Studyspace is running at http://localhost:${Number(process.env.PORT)||3000}`)))
